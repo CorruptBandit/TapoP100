@@ -7,11 +7,32 @@ from Crypto.PublicKey import RSA
 import time
 import json
 from Crypto.Cipher import AES, PKCS1_OAEP, PKCS1_v1_5
-from . import tp_link_cipher
 import ast
 import pkgutil
 import uuid
 import json
+import pkcs7
+import base64
+import os
+
+
+class TpLinkCipher:
+    def __init__(self, b_arr: bytearray, b_arr2: bytearray):
+        self.iv = b_arr2
+        self.key = b_arr
+
+    def encrypt(self, data):
+        data = pkcs7.PKCS7Encoder().encode(data)
+        data: str
+        cipher = AES.new(bytes(self.key), AES.MODE_CBC, bytes(self.iv))
+        encrypted = cipher.encrypt(data.encode("UTF-8"))
+
+        return base64.b64encode(encrypted).decode("UTF-8").replace("\r\n","")
+
+    def decrypt(self, data: str):
+        aes = AES.new(bytes(self.key), AES.MODE_CBC, bytes(self.iv))
+        pad_text = aes.decrypt(base64.b64decode(data.encode("UTF-8"))).decode("UTF-8")
+        return pkcs7.PKCS7Encoder().decode(pad_text)
 
 
 #Old Functions to get device list from tplinkcloud
@@ -354,3 +375,31 @@ class P100():
 			errorCode = ast.literal_eval(decryptedResponse)["error_code"]
 			errorMessage = self.errorCodes[str(errorCode)]
 			raise Exception(f"Error Code: {errorCode}, {errorMessage}")
+
+
+def main():
+	# Step 1: Control the P100 plug
+	p100 = P100(os.environ.get("tapo_ip"), os.environ.get("tapo_email"), os.environ.get("tapo_passwd"))
+
+	p100.handshake()  # Creates the cookies required for further methods
+	p100.login()  # Sends credentials to the plug and creates AES Key and IV for further methods
+
+	p100.turnOff()  # Turns the connected plug off
+	time.sleep(2)   # Wait for 2 seconds before turning on, adjust the delay as necessary
+	p100.turnOn()  # Turns the connected plug on
+
+	powershell_command = [
+		"powershell",
+		"-ExecutionPolicy",
+		"Bypass",
+		"-Command",
+		"Get-PnpDevice -FriendlyName 'Generic USB Hub' | Enable-PnpDevice -Confirm:$false"
+	]
+
+	# Run the PowerShell command to enable the USB hub
+	subprocess.run(powershell_command, capture_output=False, text=False)
+
+
+if __name__ == "__main__":
+	main()
+	
