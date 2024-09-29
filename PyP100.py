@@ -401,7 +401,7 @@ def main():
 	p100.login()  # Sends credentials to the plug and creates AES Key and IV for further methods
 
 	p100.turnOff()  # Turns the connected plug off
-	p100.turnOnWithDelay(2)  # Turns the connected plug on
+	p100.turnOnWithDelay(1)  # Turns the connected plug on
 
 	powershell_command = [
 		"powershell",
