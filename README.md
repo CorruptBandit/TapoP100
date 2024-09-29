@@ -3,6 +3,8 @@
 
 This forks purpose is to turn my Thunderbolt 4 KVM On & Off due to my Thunderbolt Ex4 card not initialising USB devices correctly on boot.
 
+New Auth Code from: https://github.com/almottier/TapoP100
+
 PyP100 is a Python library for controlling many of the TP-Link Tapo devices including the P100, P105, P110 plugs and the L530 and L510E bulbs.
 
 

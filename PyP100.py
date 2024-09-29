@@ -1,392 +1,407 @@
-import requests
-from requests import Session
-
-from base64 import b64encode, b64decode
 import hashlib
-from Crypto.PublicKey import RSA
-import time
-import json
-from Crypto.Cipher import AES, PKCS1_OAEP, PKCS1_v1_5
-import ast
-import pkgutil
-import uuid
-import json
-import pkcs7
-import base64
+import logging
 import os
-
-
-class TpLinkCipher:
-    def __init__(self, b_arr: bytearray, b_arr2: bytearray):
-        self.iv = b_arr2
-        self.key = b_arr
-
-    def encrypt(self, data):
-        data = pkcs7.PKCS7Encoder().encode(data)
-        data: str
-        cipher = AES.new(bytes(self.key), AES.MODE_CBC, bytes(self.iv))
-        encrypted = cipher.encrypt(data.encode("UTF-8"))
-
-        return base64.b64encode(encrypted).decode("UTF-8").replace("\r\n","")
-
-    def decrypt(self, data: str):
-        aes = AES.new(bytes(self.key), AES.MODE_CBC, bytes(self.iv))
-        pad_text = aes.decrypt(base64.b64decode(data.encode("UTF-8"))).decode("UTF-8")
-        return pkcs7.PKCS7Encoder().decode(pad_text)
-
-
-#Old Functions to get device list from tplinkcloud
-def getToken(email, password):
-	URL = "https://eu-wap.tplinkcloud.com"
-	Payload = {
-		"method": "login",
-		"params": {
-			"appType": "Tapo_Ios",
-			"cloudUserName": email,
-			"cloudPassword": password,
-			"terminalUUID": "0A950402-7224-46EB-A450-7362CDB902A2"
-		}
-	}
-
-	return requests.post(URL, json=Payload).json()['result']['token']
-
-def getDeviceList(email, password):
-	URL = "https://eu-wap.tplinkcloud.com?token=" + getToken(email, password)
-	Payload = {
-		"method": "getDeviceList",
-	}
-
-	return requests.post(URL, json=Payload).json()
-
-ERROR_CODES = {
-	"0": "Success",
-	"-1010": "Invalid Public Key Length",
-	"-1012": "Invalid terminalUUID",
-	"-1501": "Invalid Request or Credentials",
-	"1002": "Incorrect Request",
-	"-1003": "JSON formatting error "
-}
-
-class P100():
-	def __init__ (self, ipAddress, email, password):
-		self.ipAddress = ipAddress
-		self.terminalUUID = str(uuid.uuid4())
-
-		self.email = email
-		self.password = password
-		self.session = None
-		self.cookie_name = "TP_SESSIONID"
-
-		self.errorCodes = ERROR_CODES
-
-		self.encryptCredentials()
-		self.createKeyPair()
-
-	def encryptCredentials(self):
-		#Password Encoding
-		self.encodedPassword = b64encode(self.password.encode("UTF-8")).decode("UTF-8")
-
-		#Email Encoding
-		self.encodedEmail = self.sha_digest_username(self.email)
-		self.encodedEmail = b64encode(self.encodedEmail.encode("utf-8")).decode("UTF-8")
-
-	def createKeyPair(self):
-		self.keys = RSA.generate(1024)
-
-		self.privateKey = self.keys.exportKey("PEM")
-		self.publicKey  = self.keys.publickey().exportKey("PEM")
-
-	def decode_handshake_key(self, key):
-		decode: bytes = b64decode(key.encode("UTF-8"))
-		decode2: bytes = self.privateKey
-
-		cipher = PKCS1_v1_5.new(RSA.importKey(decode2))
-		do_final = cipher.decrypt(decode, None)
-		if do_final is None:
-			raise ValueError("Decryption failed!")
-
-		b_arr:bytearray = bytearray()
-		b_arr2:bytearray = bytearray()
-
-		for i in range(0, 16):
-			b_arr.insert(i, do_final[i])
-		for i in range(0, 16):
-			b_arr2.insert(i, do_final[i + 16])
-
-		return tp_link_cipher.TpLinkCipher(b_arr, b_arr2)
-
-	def sha_digest_username(self, data):
-		b_arr = data.encode("UTF-8")
-		digest = hashlib.sha1(b_arr).digest()
-
-		sb = ""
-		for i in range(0, len(digest)):
-			b = digest[i]
-			hex_string = hex(b & 255).replace("0x", "")
-			if len(hex_string) == 1:
-				sb += "0"
-				sb += hex_string
-			else:
-				sb += hex_string
-
-		return sb
-
-	def handshake(self):
-		URL = f"http://{self.ipAddress}/app"
-		Payload = {
-			"method":"handshake",
-			"params":{
-				"key": self.publicKey.decode("utf-8"),
-				"requestTimeMils": 0
-			}
-		}
-		# start new TCP session
-		if self.session:
-			self.session.close()
-		self.session = Session()
-
-		r = self.session.post(URL, json=Payload, timeout=2)
-
-		encryptedKey = r.json()["result"]["key"]
-		self.tpLinkCipher = self.decode_handshake_key(encryptedKey)
-
-		try:
-			self.cookie = f"{self.cookie_name}={r.cookies[self.cookie_name]}"
-
-		except:
-			errorCode = r.json()["error_code"]
-			errorMessage = self.errorCodes[str(errorCode)]
-			raise Exception(f"Error Code: {errorCode}, {errorMessage}")
-
-	def login(self):
-		URL = f"http://{self.ipAddress}/app"
-		Payload = {
-			"method":"login_device",
-			"params":{
-				"password": self.encodedPassword,
-				"username": self.encodedEmail
-			},
-			"requestTimeMils": 0,
-		}
-		headers = {
-			"Cookie": self.cookie
-		}
-
-		EncryptedPayload = self.tpLinkCipher.encrypt(json.dumps(Payload))
-
-		SecurePassthroughPayload = {
-			"method":"securePassthrough",
-			"params":{
-				"request": EncryptedPayload
-			}
-		}
-
-		r = self.session.post(URL, json=SecurePassthroughPayload, headers=headers, timeout=2)
-
-		decryptedResponse = self.tpLinkCipher.decrypt(r.json()["result"]["response"])
-
-		try:
-			self.token = ast.literal_eval(decryptedResponse)["result"]["token"]
-		except:
-			errorCode = ast.literal_eval(decryptedResponse)["error_code"]
-			errorMessage = self.errorCodes[str(errorCode)]
-			raise Exception(f"Error Code: {errorCode}, {errorMessage}")
-
-	def turnOn(self):
-		URL = f"http://{self.ipAddress}/app?token={self.token}"
-		Payload = {
-			"method": "set_device_info",
-			"params":{
-				"device_on": True
-			},
-			"requestTimeMils": 0,
-			"terminalUUID": self.terminalUUID
-		}
-
-		headers = {
-			"Cookie": self.cookie
-		}
-
-		EncryptedPayload = self.tpLinkCipher.encrypt(json.dumps(Payload))
-
-		SecurePassthroughPayload = {
-			"method": "securePassthrough",
-			"params": {
-				"request": EncryptedPayload
-			}
-		}
-
-		r = self.session.post(URL, json=SecurePassthroughPayload, headers=headers, timeout=2)
-
-		decryptedResponse = self.tpLinkCipher.decrypt(r.json()["result"]["response"])
-
-		if ast.literal_eval(decryptedResponse)["error_code"] != 0:
-			errorCode = ast.literal_eval(decryptedResponse)["error_code"]
-			errorMessage = self.errorCodes[str(errorCode)]
-			raise Exception(f"Error Code: {errorCode}, {errorMessage}")
-
-	def turnOff(self):
-		URL = f"http://{self.ipAddress}/app?token={self.token}"
-		Payload = {
-			"method": "set_device_info",
-			"params":{
-				"device_on": False
-			},
-			"requestTimeMils": 0,
-			"terminalUUID": self.terminalUUID
-		}
-
-		headers = {
-			"Cookie": self.cookie
-		}
-
-		EncryptedPayload = self.tpLinkCipher.encrypt(json.dumps(Payload))
-
-		SecurePassthroughPayload = {
-			"method": "securePassthrough",
-			"params":{
-				"request": EncryptedPayload
-			}
-		}
-
-		r = self.session.post(URL, json=SecurePassthroughPayload, headers=headers, timeout=2)
-
-		decryptedResponse = self.tpLinkCipher.decrypt(r.json()["result"]["response"])
-
-		if ast.literal_eval(decryptedResponse)["error_code"] != 0:
-			errorCode = ast.literal_eval(decryptedResponse)["error_code"]
-			errorMessage = self.errorCodes[str(errorCode)]
-			raise Exception(f"Error Code: {errorCode}, {errorMessage}")
-
-	def getDeviceInfo(self):
-		URL = f"http://{self.ipAddress}/app?token={self.token}"
-		Payload = {
-			"method": "get_device_info",
-			"requestTimeMils": 0,
-		}
-
-		headers = {
-			"Cookie": self.cookie
-		}
-
-		EncryptedPayload = self.tpLinkCipher.encrypt(json.dumps(Payload))
-
-		SecurePassthroughPayload = {
-			"method":"securePassthrough",
-			"params":{
-				"request": EncryptedPayload
-			}
-		}
-
-		r = self.session.post(URL, json=SecurePassthroughPayload, headers=headers)
-		decryptedResponse = self.tpLinkCipher.decrypt(r.json()["result"]["response"])
-
-		return json.loads(decryptedResponse)
-
-	def getDeviceName(self):
-		data = self.getDeviceInfo()
-
-		if data["error_code"] != 0:
-			errorCode = ast.literal_eval(decryptedResponse)["error_code"]
-			errorMessage = self.errorCodes[str(errorCode)]
-			raise Exception(f"Error Code: {errorCode}, {errorMessage}")
-		else:
-			encodedName = data["result"]["nickname"]
-			name = b64decode(encodedName)
-			return name.decode("utf-8")
-
-	def toggleState(self):
-		state = self.getDeviceInfo()["result"]["device_on"]
-		if state:
-			self.turnOff()
-		else:
-			self.turnOn()
-
-	def turnOnWithDelay(self, delay):
-		URL = f"http://{self.ipAddress}/app?token={self.token}"
-		Payload = {
-			"method": "add_countdown_rule",
-			"params": {
-				"delay": int(delay),
-				"desired_states": {
-					"on": True
-				},
-				"enable": True,
-				"remain": int(delay)
-			},
-			"terminalUUID": self.terminalUUID
-		}
-
-		headers = {
-			"Cookie": self.cookie
-		}
-
-		EncryptedPayload = self.tpLinkCipher.encrypt(json.dumps(Payload))
-
-		SecurePassthroughPayload = {
-			"method": "securePassthrough",
-			"params": {
-				"request": EncryptedPayload
-			}
-		}
-
-		r = self.session.post(URL, json=SecurePassthroughPayload, headers=headers)
-
-		decryptedResponse = self.tpLinkCipher.decrypt(r.json()["result"]["response"])
-
-		if ast.literal_eval(decryptedResponse)["error_code"] != 0:
-			errorCode = ast.literal_eval(decryptedResponse)["error_code"]
-			errorMessage = self.errorCodes[str(errorCode)]
-			raise Exception(f"Error Code: {errorCode}, {errorMessage}")
-
-	def turnOffWithDelay(self, delay):
-		URL = f"http://{self.ipAddress}/app?token={self.token}"
-		Payload = {
-			"method": "add_countdown_rule",
-			"params": {
-				"delay": int(delay),
-				"desired_states": {
-					"on": False
-				},
-				"enable": True,
-				"remain": int(delay)
-			},
-			"terminalUUID": self.terminalUUID
-		}
-
-		headers = {
-			"Cookie": self.cookie
-		}
-
-		EncryptedPayload = self.tpLinkCipher.encrypt(json.dumps(Payload))
-
-		SecurePassthroughPayload = {
-			"method": "securePassthrough",
-			"params": {
-				"request": EncryptedPayload
-			}
-		}
-
-		r = self.session.post(URL, json=SecurePassthroughPayload, headers=headers)
-
-		decryptedResponse = self.tpLinkCipher.decrypt(r.json()["result"]["response"])
-
-		if ast.literal_eval(decryptedResponse)["error_code"] != 0:
-			errorCode = ast.literal_eval(decryptedResponse)["error_code"]
-			errorMessage = self.errorCodes[str(errorCode)]
-			raise Exception(f"Error Code: {errorCode}, {errorMessage}")
+import time
+import uuid
+import subprocess
+from base64 import b64encode, b64decode
+from enum import IntEnum
+
+import requests
+from Crypto.Hash import SHA256, SHA1
+from Crypto.PublicKey import RSA
+from Crypto.Random import get_random_bytes
+from Crypto.Cipher import AES, PKCS1_v1_5
+import json
+import tempfile
+
+log = logging.getLogger(__name__)
+
+
+def sha1(data: bytes) -> bytes:
+    return SHA1.new(data).digest()
+
+
+def sha256(data: bytes) -> bytes:
+    return SHA256.new(data).digest()
+
+
+class MeasureInterval(IntEnum):
+    HOURS = 60
+    DAYS = 1440
+    MONTHS = 43200
+
+
+class AuthProtocol:
+    def __init__(self, address: str, username: str, password: str):
+        self.session = requests.Session()  # single session, stores cookie
+        self.address = address
+        self.username = username
+        self.password = password
+        self.key = None
+        self.iv = None
+        self.seq = None
+        self.sig = None
+
+    def calc_auth_hash(self, username: str, password: str) -> bytes:
+        return sha256(sha1(username.encode()) + sha1(password.encode()))
+
+    def _request_raw(self, path: str, data: bytes, params: dict = None):
+        url = f"http://{self.address}/app/{path}"
+        resp = self.session.post(url, data=data, timeout=2, params=params)
+        resp.raise_for_status()
+        data = resp.content
+        return data
+
+    def _request(self, method: str, params: dict = None):
+        if not self.key:
+            self.Initialize()
+        payload = {"method": method}
+        if params:
+            payload["params"] = params
+        log.debug(f"Request: {payload}")
+        # Encrypt payload and execute call
+        encrypted = self._encrypt(json.dumps(payload).encode("UTF-8"))
+        result = self._request_raw("request", encrypted, params={"seq": self.seq})
+        # Unwrap and decrypt result
+        data = json.loads(self._decrypt(result).decode("UTF-8"))
+        # Check error code and get result
+        if data["error_code"] != 0:
+            log.error(f"Error: {data}")
+            self.key = None
+            raise Exception(f"Error code: {data['error_code']}")
+        result = data.get("result")
+        log.debug(f"Response: {result}")
+        return result
+
+    def _encrypt(self, data: bytes):
+        self.seq += 1
+        seq = self.seq.to_bytes(4, "big", signed=True)
+        # Add PKCS#7 padding
+        pad_l = 16 - (len(data) % 16)
+        data = data + bytes([pad_l] * pad_l)
+        # Encrypt data with key
+        crypto = AES.new(self.key, AES.MODE_CBC, self.iv + seq)
+        ciphertext = crypto.encrypt(data)
+        # Signature
+        sig = sha256(self.sig + seq + ciphertext)
+        return sig + ciphertext
+
+    def _decrypt(self, data: bytes):
+        # Decrypt data with key
+        seq = self.seq.to_bytes(4, "big", signed=True)
+        crypto = AES.new(self.key, AES.MODE_CBC, self.iv + seq)
+        data = crypto.decrypt(data[32:])
+
+        # Remove PKCS#7 padding
+        data = data[: -data[-1]]
+        return data
+
+    def Initialize(self):
+        local_seed = get_random_bytes(16)
+        response = self._request_raw("handshake1", local_seed)
+        remote_seed, server_hash = response[0:16], response[16:]
+        auth_hash = None
+        for creds in [
+            (self.username, self.password),
+            ("", ""),
+            ("kasa@tp-link.net", "kasaSetup"),
+        ]:
+            ah = self.calc_auth_hash(*creds)
+            local_seed_auth_hash = sha256(local_seed + remote_seed + ah)
+            if local_seed_auth_hash == server_hash:
+                auth_hash = ah
+                log.debug(f"Authenticated with {creds[0]}")
+                break
+        if not auth_hash:
+            raise Exception("Failed to authenticate")
+        self._request_raw("handshake2", sha256(remote_seed + local_seed + auth_hash))
+        self.key = sha256(b"lsk" + local_seed + remote_seed + auth_hash)[:16]
+        ivseq = sha256(b"iv" + local_seed + remote_seed + auth_hash)
+        self.iv = ivseq[:12]
+        self.seq = int.from_bytes(ivseq[-4:], "big", signed=True)
+        self.sig = sha256(b"ldk" + local_seed + remote_seed + auth_hash)[:28]
+        log.debug(f"Initialized")
+
+
+class OldProtocol:
+    def __init__(
+        self,
+        address: str,
+        username: str,
+        password: str,
+        keypair_file: str = os.path.join(tempfile.gettempdir(), "tapo.key"),
+    ):
+        self.session = requests.Session()  # single session, stores cookie
+        self.terminal_uuid = str(uuid.uuid4())
+        self.address = address
+        self.username = username
+        self.password = password
+        self.keypair_file = keypair_file
+        self._create_keypair()
+        self.key = None
+        self.iv = None
+
+    def _create_keypair(self):
+        if self.keypair_file and os.path.exists(self.keypair_file):
+            with open(self.keypair_file, "r") as f:
+                self.keypair = RSA.importKey(f.read())
+        else:
+            self.keypair = RSA.generate(1024)
+            if self.keypair_file:
+                with open(self.keypair_file, "wb") as f:
+                    f.write(self.keypair.exportKey("PEM"))
+
+    def _request_raw(self, method: str, params: dict = None):
+        # Construct url, add token if we have one
+        url = f"http://{self.address}/app"
+        if self.token:
+            url += f"?token={self.token}"
+
+        # Construct payload, add params if given
+        payload = {
+            "method": method,
+            "requestTimeMils": int(round(time.time() * 1000)),
+            "terminalUUID": self.terminal_uuid,
+        }
+        if params:
+            payload["params"] = params
+        log.debug(f"Request raw: {payload}")
+
+        # Execute call
+        resp = self.session.post(url, json=payload, timeout=2)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Check error code and get result
+        if data["error_code"] != 0:
+            log.error(f"Error: {data}")
+            self.key = None
+            raise Exception(f"Error code: {data['error_code']}")
+        result = data.get("result")
+
+        log.debug(f"Response raw: {result}")
+        return result
+
+    def _request(self, method: str, params: dict = None):
+        if not self.key:
+            self.Initialize()
+
+        # Construct payload, add params if given
+        payload = {
+            "method": method,
+            "requestTimeMils": int(round(time.time() * 1000)),
+            "terminalUUID": self.terminal_uuid,
+        }
+        if params:
+            payload["params"] = params
+        log.debug(f"Request: {payload}")
+
+        # Encrypt payload and execute call
+        encrypted = self._encrypt(json.dumps(payload))
+
+        result = self._request_raw("securePassthrough", {"request": encrypted})
+
+        # Unwrap and decrypt result
+        data = json.loads(self._decrypt(result["response"]))
+        if data["error_code"] != 0:
+            log.error(f"Error: {data}")
+            self.key = None
+            raise Exception(f"Error code: {data['error_code']}")
+        result = data.get("result")
+
+        log.debug(f"Response: {result}")
+        return result
+
+    def _encrypt(self, data: str):
+        data = data.encode("UTF-8")
+
+        # Add PKCS#7 padding
+        pad_l = 16 - (len(data) % 16)
+        data = data + bytes([pad_l] * pad_l)
+
+        # Encrypt data with key
+        crypto = AES.new(self.key, AES.MODE_CBC, self.iv)
+        data = crypto.encrypt(data)
+
+        # Base64 encode
+        data = b64encode(data).decode("UTF-8")
+        return data
+
+    def _decrypt(self, data: str):
+        # Base64 decode data
+        data = b64decode(data.encode("UTF-8"))
+
+        # Decrypt data with key
+        crypto = AES.new(self.key, AES.MODE_CBC, self.iv)
+        data = crypto.decrypt(data)
+
+        # Remove PKCS#7 padding
+        data = data[: -data[-1]]
+        return data.decode("UTF-8")
+
+    def Initialize(self):
+        # Unset key and token
+        self.key = None
+        self.token = None
+
+        # Send public key and receive encrypted symmetric key
+        public_key = self.keypair.publickey().exportKey("PEM").decode("UTF-8")
+        public_key = public_key.replace("RSA PUBLIC KEY", "PUBLIC KEY")
+        result = self._request_raw("handshake", {"key": public_key})
+        encrypted = b64decode(result["key"].encode("UTF-8"))
+
+        # Decrypt symmetric key
+        cipher = PKCS1_v1_5.new(self.keypair)
+        decrypted = cipher.decrypt(encrypted, None)
+        self.key, self.iv = decrypted[:16], decrypted[16:]
+
+        # Base64 encode password and hashed username
+        digest = hashlib.sha1(self.username.encode("UTF-8")).hexdigest()
+        username = b64encode(digest.encode("UTF-8")).decode("UTF-8")
+        password = b64encode(self.password.encode("UTF-8")).decode("UTF-8")
+
+        # Send login info and receive session token
+        result = self._request(
+            "login_device", {"username": username, "password": password}
+        )
+        self.token = result["token"]
+
+
+class Device:
+    def __init__(self, address, email, password, preferred_protocol=None, **kwargs):
+        self.address = address
+        self.email = email
+        self.password = password
+        self.kwargs = kwargs
+        self.protocol = None
+        self.preferred_protocol = preferred_protocol
+
+    def _initialize(self):
+        protocol_classes = {"new": AuthProtocol, "old": OldProtocol}
+
+        # set preferred protocol if specified
+        if self.preferred_protocol and self.preferred_protocol in protocol_classes:
+            protocols_to_try = [protocol_classes[self.preferred_protocol]]
+        else:
+            protocols_to_try = list(protocol_classes.values())
+
+        for protocol_class in protocols_to_try:
+            if not self.protocol:
+                try:
+                    protocol = protocol_class(
+                        self.address, self.email, self.password, **self.kwargs
+                    )
+                    protocol.Initialize()
+                    self.protocol = protocol
+                except:
+                    log.exception(
+                        f"Failed to initialize protocol {protocol_class.__name__}"
+                    )
+        if not self.protocol:
+            raise Exception("Failed to initialize protocol")
+
+    def request(self, method: str, params: dict = None):
+        if not self.protocol:
+            self._initialize()
+        return self.protocol._request(method, params)
+
+    def handshake(self):
+        if not self.protocol:
+            self._initialize()
+        return
+
+    def login(self):
+        return self.handshake()
+
+    def getDeviceInfo(self):
+        return self.request("get_device_info")
+
+    def _get_device_info(self):
+        return self.request("get_device_info")
+
+    def _set_device_info(self, params: dict):
+        return self.request("set_device_info", params)
+
+    def getCountDownRules(self):
+        return self.request("get_countdown_rules")
+
+    def getDeviceName(self):
+        data = self.getDeviceInfo()
+        encodedName = data["nickname"]
+        name = b64decode(encodedName)
+        return name.decode("utf-8")
+
+    def switch_with_delay(self, state, delay):
+        return self.request(
+            "add_countdown_rule",
+            {
+                "delay": int(delay),
+                "desired_states": {"on": state},
+                "enable": True,
+                "remain": int(delay),
+            },
+        )
+
+
+class Switchable(Device):
+    def get_status(self) -> bool:
+        return self._get_device_info()["device_on"]
+
+    def set_status(self, status: bool):
+        return self._set_device_info({"device_on": status})
+
+    def turnOn(self):
+        return self.set_status(True)
+
+    def turnOff(self):
+        return self.set_status(False)
+
+    def toggleState(self):
+        return self.set_status(not self.get_status())
+
+    def turnOnWithDelay(self, delay):
+        return self.switch_with_delay(True, delay)
+
+    def turnOffWithDelay(self, delay):
+        return self.switch_with_delay(False, delay)
+
+
+class Metering(Device):
+    def getEnergyUsage(self) -> dict:
+        return self.request("get_energy_usage")
+
+    def getEnergyData(self, start_timestamp: int, end_timestamp: int, interval: MeasureInterval) -> dict:
+        """Hours are always ignored, start is rounded to midnight, first day of month or first of January based on interval"""
+        return self.request("get_energy_data", {"start_timestamp": start_timestamp, "end_timestamp": end_timestamp, "interval": interval.value})
+
+
+class Color(Device):
+    def setBrightness(self, brightness: int):
+        return self._set_device_info({"brightness": brightness})
+
+    def setColorTemp(self, color_temp: int):
+        return self._set_device_info({"color_temp": color_temp})
+
+    def setColor(self, hue, saturation):
+        return self._set_device_info(
+            {"color_temp": 0, "hue": hue, "saturation": saturation}
+        )
+
+
+class P100(Switchable):
+    pass
 
 
 def main():
 	# Step 1: Control the P100 plug
-	p100 = P100(os.environ.get("tapo_ip"), os.environ.get("tapo_email"), os.environ.get("tapo_passwd"))
+	p100 = P100(os.getenv("TAPO_P100_IP"), os.getenv("TAPO_P100_EMAIL"), os.getenv("TAPO_P100_PASSWORD"))
 
 	p100.handshake()  # Creates the cookies required for further methods
 	p100.login()  # Sends credentials to the plug and creates AES Key and IV for further methods
 
 	p100.turnOff()  # Turns the connected plug off
-	time.sleep(2)   # Wait for 2 seconds before turning on, adjust the delay as necessary
-	p100.turnOn()  # Turns the connected plug on
+	p100.turnOnWithDelay(2)  # Turns the connected plug on
 
 	powershell_command = [
 		"powershell",
@@ -397,9 +412,8 @@ def main():
 	]
 
 	# Run the PowerShell command to enable the USB hub
-	subprocess.run(powershell_command, capture_output=False, text=False)
+	subprocess.run(powershell_command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 if __name__ == "__main__":
 	main()
-	
